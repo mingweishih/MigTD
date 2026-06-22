@@ -11,9 +11,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{self, value::RawValue};
 
 use crate::{
-    v2::{bytes_to_hex_string, hex_string_to_bytes, policy, verify_event_hash},
-    CcEvent, Collaterals, EventName, PolicyError, ServtdCollateral, TdIdentity, TdTcbMapping,
+    v2::{
+        bytes_to_hex_string, hex_string_to_bytes, measurements_from_report, policy,
+        verify_event_hash, LegacyServtdProvider, Measurements, ServtdIdentity, ServtdLookup,
+        ServtdProvider,
+    },
+    CcEvent, Collaterals, EventName, PolicyError, Report, ServtdCollateral, TdIdentity, TdTcbMapping,
 };
+
+#[cfg(feature = "servtd_corim")]
+use crate::v2::ServtdCorim;
 
 #[derive(Clone, Copy, Debug)]
 pub enum TcbStatus {
@@ -175,6 +182,13 @@ pub struct VerifiedPolicy<'a> {
     pub servtd_tcb_mapping_issuer_chain: String,
     /// The policy signing certificate chain (PEM) used to verify this policy.
     pub policy_issuer_chain: String,
+    /// Optional CoRIM-encoded servtd collateral. When present, it takes
+    /// precedence over the legacy `servtd_identity` + `servtd_tcb_mapping`
+    /// JSON for servtd lookups. Only available with the `servtd_corim`
+    /// feature; otherwise the field does not exist and all lookups use the
+    /// legacy collateral.
+    #[cfg(feature = "servtd_corim")]
+    servtd_corim: Option<ServtdCorim>,
 }
 
 impl VerifiedPolicy<'_> {
@@ -184,6 +198,57 @@ impl VerifiedPolicy<'_> {
 
     pub fn get_version(&self) -> &str {
         &self.policy_data.version
+    }
+
+    /// Attach decoded CoRIM servtd collateral. Once set, **all** servtd
+    /// lookups resolve against the CoRIM and the legacy JSON collateral is
+    /// no longer consulted (fail-closed: a CoRIM miss is a miss, with no
+    /// fallback to legacy).
+    #[cfg(feature = "servtd_corim")]
+    pub fn set_servtd_corim(&mut self, corim: ServtdCorim) {
+        self.servtd_corim = Some(corim);
+    }
+
+    /// Resolve `(isvsvn, tcb_date, tcb_status)` for the supplied identity.
+    ///
+    /// Provider selection is **fail-closed**: when a CoRIM is attached it is
+    /// the sole authority — the legacy collateral is not consulted, and a
+    /// CoRIM miss (or an identity that lacks a `SERVTD_INFO_HASH`) returns
+    /// `None`. Without an attached CoRIM (the default, and the only case
+    /// when the `servtd_corim` feature is off) the legacy provider is used.
+    pub fn servtd_lookup(&self, id: &ServtdIdentity) -> Option<ServtdLookup> {
+        #[cfg(feature = "servtd_corim")]
+        if let Some(corim) = &self.servtd_corim {
+            return corim.lookup(id);
+        }
+        self.legacy_servtd_provider().lookup(id)
+    }
+
+    /// Convenience: resolve from raw measurements. Equivalent to
+    /// `servtd_lookup(&ServtdIdentity::from_measurements(m))`.
+    pub fn servtd_lookup_by_measurements(
+        &self,
+        measurements: &Measurements,
+    ) -> Option<ServtdLookup> {
+        self.servtd_lookup(&ServtdIdentity::from_measurements(measurements))
+    }
+
+    /// Convenience: resolve from a verified `Report` by extracting its
+    /// measurement registers.
+    pub fn servtd_lookup_by_report(&self, report: &Report) -> Option<ServtdLookup> {
+        let measurements = measurements_from_report(report)?;
+        self.servtd_lookup(&ServtdIdentity::from_measurements(&measurements))
+    }
+
+    /// Convenience: resolve from a `SERVTD_INFO_HASH`. Only the CoRIM
+    /// provider keys on the hash, so without an attached CoRIM this returns
+    /// `None`.
+    pub fn servtd_lookup_by_hash(&self, hash: &[u8]) -> Option<ServtdLookup> {
+        self.servtd_lookup(&ServtdIdentity::from_hash(hash))
+    }
+
+    fn legacy_servtd_provider(&self) -> LegacyServtdProvider<'_> {
+        LegacyServtdProvider::new(&self.servtd_tcb_mapping, &self.servtd_identity)
     }
 }
 
@@ -251,6 +316,8 @@ impl<'a> RawPolicyData<'a> {
             servtd_tcb_mapping,
             servtd_tcb_mapping_issuer_chain,
             policy_issuer_chain,
+            #[cfg(feature = "servtd_corim")]
+            servtd_corim: None,
         })
     }
 
@@ -860,6 +927,54 @@ mod test {
         let issuer_chain =
             include_bytes!("../../test/policy_v2/cert_chain/policy_issuer_chain.pem");
         policy.verify(issuer_chain).unwrap();
+    }
+
+    /// Once a CoRIM is attached, `servtd_lookup` is fail-closed: the legacy
+    /// collateral is no longer consulted, so a measurement-only identity
+    /// (which the CoRIM cannot key on) misses even though the legacy table
+    /// would have matched it.
+    #[cfg(feature = "servtd_corim")]
+    #[test]
+    fn servtd_lookup_is_fail_closed_when_corim_attached() {
+        use crate::v2::ServtdCorim;
+
+        let policy_data = include_bytes!("../../test/policy_v2/policy_v2.json");
+        let policy = RawPolicyData::deserialize_from_json(policy_data).unwrap();
+        let issuer_chain =
+            include_bytes!("../../test/policy_v2/cert_chain/policy_issuer_chain.pem");
+        let mut verified = policy.verify(issuer_chain).unwrap();
+
+        // Build the same measurement set the legacy table maps (from the
+        // servtd collateral fixture used by `test_get_engine_svn`).
+        let mrtd = "E2C7DA7CF0D93973480F0A34A6FE52A204EA81B4F1B6CD16018F5B4CAEE7B3B544A9738464A7C95E1705E20687A0ADA6";
+        let rtmr = "518923B0F955D08DA077C96AABA522B9DECEDE61C599CEA6C41889CFBEA4AE4D50529D96FE4D1AFDAFB65E7F95BF23C4";
+        let measurements = Measurements {
+            mrtd: mrtd.to_string(),
+            rtmr0: rtmr.to_string(),
+            rtmr1: rtmr.to_string(),
+            rtmr2: None,
+            rtmr3: Some(
+                "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+        };
+
+        // Before attaching: legacy provider resolves the measurement set.
+        assert!(verified.servtd_lookup_by_measurements(&measurements).is_some());
+
+        // Attach a CoRIM that only knows an unrelated hash.
+        let tcb = include_bytes!("../../test/policy_v2/corim/tcb_mapping.cbor");
+        let id = include_bytes!("../../test/policy_v2/corim/td_identity.cbor");
+        verified.set_servtd_corim(ServtdCorim::decode(tcb, id, 0).unwrap());
+
+        // After attaching: measurement-only lookup is fail-closed (no
+        // legacy fallback) -> miss.
+        assert!(verified.servtd_lookup_by_measurements(&measurements).is_none());
+
+        // ...but a hash the CoRIM knows resolves through it.
+        let hit = verified.servtd_lookup_by_hash(&[0xAAu8; 48]);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().isvsvn, 5);
     }
 
     #[test]

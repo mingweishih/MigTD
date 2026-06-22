@@ -288,9 +288,8 @@ mod v2 {
         let servtd_ext_src_obj =
             ServtdExt::read_from_bytes(servtd_ext_src).ok_or(PolicyError::InvalidParameter)?;
         let init_td_info = verify_init_tdinfo(init_tdinfo, &servtd_ext_src_obj)?;
-        let _engine_svn = policy
-            .servtd_tcb_mapping
-            .get_engine_svn_by_measurements(&Measurements::new_from_bytes(
+        let _migtd = policy
+            .servtd_lookup_by_measurements(&Measurements::new_from_bytes(
                 &init_td_info.mrtd,
                 &init_td_info.rtmr0,
                 &init_td_info.rtmr1,
@@ -573,11 +572,7 @@ mod v2 {
         let tcb_evaluation_number = get_tcb_evaluation_number_from_collateral(&collateral)?;
         let report_value = Report::new(suppl_data)?;
 
-        let migtd_svn = policy
-            .servtd_tcb_mapping
-            .get_engine_svn_by_report(&report_value);
-
-        let migtd_tcb = migtd_svn.and_then(|svn| policy.servtd_identity.get_tcb_level_by_svn(svn));
+        let migtd = policy.servtd_lookup_by_report(&report_value);
         let pck_crl_num = get_crl_number(collaterals.pck_crl.as_bytes())
             .map_err(|_| PolicyError::InvalidCollateral)?;
         let root_ca_crl_num = get_crl_number(collaterals.root_ca_crl.as_bytes())
@@ -589,9 +584,9 @@ mod v2 {
             tcb_status: Some(tcb_status.as_str().to_string()),
             tcb_evaluation_number: Some(tcb_evaluation_number),
             fmspc: Some(fmspc),
-            migtd_isvsvn: migtd_svn,
-            migtd_tcb_date: migtd_tcb.map(|tcb| tcb.tcb_date.clone()),
-            migtd_tcb_status: migtd_tcb.map(|tcb| tcb.tcb_status.clone()),
+            migtd_isvsvn: migtd.as_ref().map(|m| m.isvsvn),
+            migtd_tcb_date: migtd.as_ref().map(|m| m.tcb_date.clone()),
+            migtd_tcb_status: migtd.as_ref().map(|m| m.tcb_status.clone()),
             pck_crl_num: Some(pck_crl_num),
             root_ca_crl_num: Some(root_ca_crl_num),
         })
@@ -601,17 +596,13 @@ mod v2 {
         tdreport: &TdxReport,
         policy: &VerifiedPolicy,
     ) -> Result<PolicyEvaluationInfo, PolicyError> {
-        let migtd_svn = policy.servtd_tcb_mapping.get_engine_svn_by_measurements(
-            &Measurements::new_from_bytes(
-                &tdreport.td_info.mrtd,
-                &tdreport.td_info.rtmr0,
-                &tdreport.td_info.rtmr1,
-                None,
-                None,
-            ),
-        );
-
-        let migtd_tcb = migtd_svn.and_then(|svn| policy.servtd_identity.get_tcb_level_by_svn(svn));
+        let migtd = policy.servtd_lookup_by_measurements(&Measurements::new_from_bytes(
+            &tdreport.td_info.mrtd,
+            &tdreport.td_info.rtmr0,
+            &tdreport.td_info.rtmr1,
+            None,
+            None,
+        ));
 
         Ok(PolicyEvaluationInfo {
             tee_tcb_svn: Some(tdreport.tee_tcb_info.tee_tcb_svn),
@@ -619,9 +610,9 @@ mod v2 {
             tcb_status: None,
             tcb_evaluation_number: None,
             fmspc: None,
-            migtd_isvsvn: migtd_svn,
-            migtd_tcb_date: migtd_tcb.map(|tcb| tcb.tcb_date.clone()),
-            migtd_tcb_status: migtd_tcb.map(|tcb| tcb.tcb_status.clone()),
+            migtd_isvsvn: migtd.as_ref().map(|m| m.isvsvn),
+            migtd_tcb_date: migtd.as_ref().map(|m| m.tcb_date.clone()),
+            migtd_tcb_status: migtd.as_ref().map(|m| m.tcb_status.clone()),
             pck_crl_num: None,
             root_ca_crl_num: None,
         })

@@ -11,6 +11,12 @@ mod collaterals;
 pub use collaterals::*;
 mod policy;
 pub use policy::*;
+mod servtd_provider;
+pub use servtd_provider::*;
+#[cfg(feature = "servtd_corim")]
+mod servtd_corim;
+#[cfg(feature = "servtd_corim")]
+pub use servtd_corim::*;
 
 impl<'a> Report<'a> {
     pub fn new(report: &'a [u8]) -> Result<Self, PolicyError> {
